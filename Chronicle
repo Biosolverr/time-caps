@@ -1,0 +1,319 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
+
+/// @title ChronicleCapsules
+/// @notice Тайм-капсулы с commit–reveal и опциональными депозитами ETH.
+/// @dev Хранит только хэш содержимого (salt + payload). Раскрытие возможно
+///      после `unlockTime`, депозит распределяется по pull-withdraw схеме.
+contract ChronicleCapsules {
+    // ============
+    // Кастомные ошибки
+    // ============
+
+    /// @dev Передан нулевой коммит.
+    error ZeroCommit();
+    /// @dev Время разблокировки должно быть строго в будущем.
+    error UnlockNotInFuture();
+    /// @dev Капсула с таким id не найдена.
+    error CapsuleNotFound();
+    /// @dev Вызывающий не является создателем капсулы.
+    error NotCreator();
+    /// @dev Вызывающий не имеет прав на раскрытие капсулы.
+    error NotAuthorizedToReveal();
+    /// @dev Капсула уже раскрыта.
+    error AlreadyRevealed();
+    /// @dev Капсула уже отменена.
+    error AlreadyCanceled();
+    /// @dev Попытка раскрыть капсулу до наступления времени разблокировки.
+    error TooEarlyToReveal();
+    /// @dev Раскрытие не прошло проверку: хэш (salt, payload) не совпал с commit.
+    error InvalidReveal();
+    /// @dev Время разблокировки уже наступило.
+    error UnlockAlreadyReached();
+    /// @dev Новое время разблокировки не позже текущего.
+    error NewUnlockNotLater();
+    /// @dev Депозит больше, чем помещается в uint128.
+    error DepositTooLarge();
+    /// @dev Для вызывающего нет доступных средств к выводу.
+    error NothingToWithdraw();
+    /// @dev Вызов на вывод ETH завершился неудачно.
+    error WithdrawFailed();
+
+    // ============
+    // События
+    // ============
+
+    /// @notice Эмитится при создании новой капсулы.
+    /// @param capsuleId Уникальный идентификатор капсулы.
+    /// @param creator Адрес создателя капсулы.
+    /// @param beneficiary Адрес бенефициара, который получит депозит после раскрытия (или 0).
+    /// @param unlockTime Время разблокировки в формате Unix timestamp.
+    /// @param commit Хеш коммита keccak256(abi.encode(salt, payload)).
+    /// @param deposit Размер депозита в wei.
+    event CapsuleCreated(
+        uint256 indexed capsuleId,
+        address indexed creator,
+        address indexed beneficiary,
+        uint64 unlockTime,
+        bytes32 commit,
+        uint128 deposit
+    );
+
+    /// @notice Эмитится при отмене капсулы создателем.
+    /// @param capsuleId Уникальный идентификатор капсулы.
+    /// @param creator Адрес создателя капсулы.
+    event CapsuleCanceled(uint256 indexed capsuleId, address indexed creator);
+
+    /// @notice Эмитится при продлении времени разблокировки капсулы.
+    /// @param capsuleId Уникальный идентификатор капсулы.
+    /// @param oldUnlockTime Старое время разблокировки.
+    /// @param newUnlockTime Новое время разблокировки.
+    event CapsuleUnlockExtended(uint256 indexed capsuleId, uint64 oldUnlockTime, uint64 newUnlockTime);
+
+    /// @notice Эмитится при раскрытии содержимого капсулы.
+    /// @dev payload передается как bytes; если это UTF‑8-текст, фронтенды могут его декодировать.
+    /// @param capsuleId Уникальный идентификатор капсулы.
+    /// @param revealer Адрес того, кто раскрыл капсулу.
+    /// @param commit Хеш коммита.
+    /// @param payload Содержимое капсулы (произвольные данные).
+    event CapsuleRevealed(
+        uint256 indexed capsuleId,
+        address indexed revealer,
+        bytes32 commit,
+        bytes payload
+    );
+
+    /// @notice Эмитится при выводе средств.
+    /// @param to Адрес получателя.
+    /// @param amount Сумма выведенных средств в wei.
+    event Withdrawal(address indexed to, uint256 amount);
+
+    // ============
+    // Модель данных
+    // ============
+
+    /// @dev Структура, представляющая одну капсулу.
+    struct Capsule {
+        address creator;      // Создатель капсулы.
+        address beneficiary;  // Получатель депозита после успешного reveal (или 0).
+        uint64 unlockTime;    // Время, после которого капсулу можно раскрыть.
+        uint128 deposit;      // Размер депозита (переносится в withdrawCredits при cancel/reveal).
+        bytes32 commit;       // keccak256(abi.encode(salt, payload)).
+        bool revealed;        // true, если капсула уже раскрыта.
+        bool canceled;        // true, если капсула отменена.
+    }
+
+    /// @dev Хранилище капсул по capsuleId.
+    mapping(uint256 => Capsule) private _capsules;
+
+    /// @dev nonce на создателя; участвует в генерации capsuleId.
+    mapping(address => uint256) public nonces;
+
+    /// @dev Кредиты на вывод для pull-withdraw схемы.
+    mapping(address => uint256) public withdrawCredits;
+
+    // ============
+    // Защита от реентрансии
+    // ============
+
+    /// @dev Лок для простого nonReentrant.
+    uint256 private _lock = 1;
+
+    /// @dev Модификатор для защиты от реентрансии.
+    modifier nonReentrant() {
+        require(_lock == 1, "REENTRANCY");
+        _lock = 2;
+        _;
+        _lock = 1;
+    }
+
+    // ============
+    // Views / helpers
+    // ============
+
+    /// @notice Вычисляет хеш коммита как keccak256(abi.encode(salt, payload)).
+    /// @param salt Соль, смешиваемая с payload.
+    /// @param payload Данные, которые будут «запакованы» в капсулу.
+    /// @return Хеш коммита, который нужно передавать в createCapsule.
+    function computeCommit(bytes32 salt, bytes calldata payload) external pure returns (bytes32) {
+        return keccak256(abi.encode(salt, payload));
+    }
+
+    /// @notice Возвращает данные капсулы по её идентификатору.
+    /// @dev Ревертает, если капсула не существует.
+    /// @param capsuleId Идентификатор капсулы.
+    /// @return c Полная структура Capsule.
+    function getCapsule(uint256 capsuleId) external view returns (Capsule memory c) {
+        c = _capsules[capsuleId];
+        if (c.creator == address(0)) revert CapsuleNotFound();
+    }
+
+    // ============
+    // Основные действия
+    // ============
+
+    /// @notice Создаёт новую капсулу с коммитом и временем разблокировки в будущем.
+    /// @param commit Хеш коммита keccak256(abi.encode(salt, payload)).
+    /// @param unlockTime Unix timestamp времени разблокировки (строго в будущем).
+    /// @param beneficiary Получатель депозита после раскрытия
+    ///        (если адрес нулевой, депозит вернётся создателю).
+    /// @return capsuleId Уникальный идентификатор созданной капсулы.
+    function createCapsule(
+        bytes32 commit,
+        uint64 unlockTime,
+        address beneficiary
+    ) external payable returns (uint256 capsuleId) {
+        if (commit == bytes32(0)) revert ZeroCommit();
+        if (unlockTime <= block.timestamp) revert UnlockNotInFuture();
+
+        // Ограничение размера депозита под тип uint128.
+        if (msg.value > type(uint128).max) revert DepositTooLarge();
+
+        uint256 n = nonces[msg.sender]++;
+        capsuleId = uint256(keccak256(abi.encodePacked(
+            bytes1(0xCC),              // «доменный селектор», чтобы id не выглядели как обычные хэши
+            block.chainid,
+            address(this),
+            msg.sender,
+            beneficiary,
+            unlockTime,
+            commit,
+            n
+        )));
+
+        // Крайне маловероятная коллизия; если случится — делаем ещё одну попытку.
+        Capsule storage c = _capsules[capsuleId];
+        if (c.creator != address(0)) {
+            // Пытаемся пересчитать id с другим префиксом и новым nonce.
+            n = nonces[msg.sender]++;
+            capsuleId = uint256(keccak256(abi.encodePacked(
+                bytes1(0xCD),
+                block.chainid,
+                address(this),
+                msg.sender,
+                beneficiary,
+                unlockTime,
+                commit,
+                n
+            )));
+            c = _capsules[capsuleId];
+            require(c.creator == address(0), "ID_COLLISION");
+        }
+
+        c.creator = msg.sender;
+        c.beneficiary = beneficiary;
+        c.unlockTime = unlockTime;
+        c.deposit = uint128(msg.value);
+        c.commit = commit;
+        c.revealed = false;
+        c.canceled = false;
+
+        emit CapsuleCreated(capsuleId, msg.sender, beneficiary, unlockTime, commit, uint128(msg.value));
+    }
+
+    /// @notice Создатель может отменить капсулу до времени разблокировки.
+    /// @dev Депозит (если есть) становится доступен для вывода создателем.
+    /// @param capsuleId Идентификатор капсулы.
+    function cancelCapsule(uint256 capsuleId) external {
+        Capsule storage c = _capsules[capsuleId];
+        if (c.creator == address(0)) revert CapsuleNotFound();
+        if (msg.sender != c.creator) revert NotCreator();
+        if (c.revealed) revert AlreadyRevealed();
+        if (c.canceled) revert AlreadyCanceled();
+        if (block.timestamp >= c.unlockTime) revert UnlockAlreadyReached();
+
+        c.canceled = true;
+
+        uint256 amount = c.deposit;
+        if (amount != 0) {
+            c.deposit = 0;
+            withdrawCredits[c.creator] += amount;
+        }
+
+        emit CapsuleCanceled(capsuleId, msg.sender);
+    }
+
+    /// @notice Создатель может продлить время разблокировки (только вперёд), пока капсула заблокирована.
+    /// @param capsuleId Идентификатор капсулы.
+    /// @param newUnlockTime Новое время разблокировки (должно быть > текущего).
+    function extendUnlockTime(uint256 capsuleId, uint64 newUnlockTime) external {
+        Capsule storage c = _capsules[capsuleId];
+        if (c.creator == address(0)) revert CapsuleNotFound();
+        if (msg.sender != c.creator) revert NotCreator();
+        if (c.revealed) revert AlreadyRevealed();
+        if (c.canceled) revert AlreadyCanceled();
+        if (block.timestamp >= c.unlockTime) revert UnlockAlreadyReached();
+        if (newUnlockTime <= c.unlockTime) revert NewUnlockNotLater();
+
+        uint64 old = c.unlockTime;
+        c.unlockTime = newUnlockTime;
+        emit CapsuleUnlockExtended(capsuleId, old, newUnlockTime);
+    }
+
+    /// @notice Раскрывает содержимое капсулы после времени разблокировки.
+    /// @dev Проверяет, что keccak256(abi.encode(salt, payload)) совпадает с commit.
+    ///      Если есть депозит, он переводится в кредиты бенефициара (или создателя, если beneficiary == 0).
+    /// @param capsuleId Идентификатор капсулы.
+    /// @param salt Соль, использованная при формировании коммита.
+    /// @param payload Произвольные данные капсулы.
+    function reveal(uint256 capsuleId, bytes32 salt, bytes calldata payload) external {
+        Capsule storage c = _capsules[capsuleId];
+        if (c.creator == address(0)) revert CapsuleNotFound();
+        if (c.revealed) revert AlreadyRevealed();
+        if (c.canceled) revert AlreadyCanceled();
+        if (block.timestamp < c.unlockTime) revert TooEarlyToReveal();
+
+        // Разрешаем раскрывать только создателю или бенефициару.
+        // Если beneficiary == address(0), то раскрывать может только создатель.
+        if (msg.sender != c.creator) {
+            if (c.beneficiary == address(0) || msg.sender != c.beneficiary) revert NotAuthorizedToReveal();
+        }
+
+        bytes32 computed = keccak256(abi.encode(salt, payload));
+        if (computed != c.commit) revert InvalidReveal();
+
+        c.revealed = true;
+
+        uint256 amount = c.deposit;
+        if (amount != 0) {
+            c.deposit = 0;
+            address receiver = c.beneficiary == address(0) ? c.creator : c.beneficiary;
+            withdrawCredits[receiver] += amount;
+        }
+
+        emit CapsuleRevealed(capsuleId, msg.sender, c.commit, payload);
+    }
+
+    /// @notice Вывод доступных к выводу средств для msg.sender.
+    /// @dev Реализация pull-withdraw: контракт не пушит ETH сам, пользователь забирает.
+    function withdraw() external nonReentrant {
+        uint256 amount = withdrawCredits[msg.sender];
+        if (amount == 0) revert NothingToWithdraw();
+
+        withdrawCredits[msg.sender] = 0;
+
+        (bool ok, ) = msg.sender.call{value: amount}("");
+        if (!ok) {
+            // Восстанавливаем баланс при неудаче.
+            withdrawCredits[msg.sender] = amount;
+            revert WithdrawFailed();
+        }
+
+        emit Withdrawal(msg.sender, amount);
+    }
+
+    // ============
+    // Receive / fallback
+    // ============
+
+    /// @dev Контракт не предназначен для произвольных переводов ETH.
+    ///      Для депозитов используйте createCapsule().
+    receive() external payable {
+        revert("DIRECT_ETH_NOT_ACCEPTED");
+    }
+
+    /// @dev Отклоняет вызовы к несуществующим функциям.
+    fallback() external payable {
+        revert("NO_FALLBACK");
+    }
+}
